@@ -1014,8 +1014,22 @@ class Scheduler(
     def _recv_requests_async(self):
         """
         Background thread function to receive requests asynchronously.
-        ONLY does I/O operations, does NOT modify scheduler state to avoid race conditions.
-        State modifications are done in the main thread via process_input_requests().
+
+        CRITICAL LIMITATION:
+        Due to thread-safety issues with ZMQ sockets and PyTorch CUDA context,
+        we CANNOT safely call recv_pyobj() from a background thread when the
+        received objects contain CUDA tensors (e.g., multimodal embeddings).
+
+        The recv_pyobj() -> pickle.loads() -> torch._load_from_bytes() chain
+        requires the correct CUDA context, which is bound to the main thread.
+
+        Current implementation: Call recv_requests() in background thread.
+        This works for text-only requests, but may hang for multimodal requests.
+
+        TODO: Implement a safer approach:
+        - Option 1: Only recv() raw bytes in background, deserialize in main thread
+        - Option 2: Initialize CUDA context in background thread (complex)
+        - Option 3: Use a separate process instead of thread (IPC overhead)
 
         Thread safety analysis:
         - recv_requests() may read self.last_batch.forward_mode for recv_skipper
@@ -1024,6 +1038,11 @@ class Scheduler(
         - Worst case: recv_skipper reads stale forward_mode, causing suboptimal skip decision
         - Impact: One extra/missing recv attempt, self-corrects in next iteration
         - Trade-off: Acceptable for the performance gain of overlapping I/O with GPU compute
+
+        ZMQ thread safety:
+        - ZMQ sockets are NOT thread-safe per official documentation
+        - Accessing recv_from_tokenizer from background thread violates this
+        - May cause undefined behavior, especially under high load
         """
         return self.recv_requests()
 
