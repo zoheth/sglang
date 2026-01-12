@@ -1044,14 +1044,14 @@ class Scheduler(
             try:
                 # Wait for the prefetch task to complete and get the result
                 recv_reqs = self.prefetch_future.result(timeout=10.0)  # 10s timeout
-                return recv_reqs
+                self.prefetch_future = None
+                return recv_reqs if recv_reqs is not None else []
             except Exception as e:
                 logger.error(f"Error in async request receiving: {e}")
                 import traceback
                 traceback.print_exc()
-                return []
-            finally:
                 self.prefetch_future = None
+                return []
         else:
             return []
 
@@ -1083,6 +1083,9 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
 
             if self._engine_paused:
+                # Start prefetch even when paused to keep receiving requests
+                if self.enable_async_input_processing:
+                    self._start_prefetch_if_needed()
                 continue
 
             batch = self.get_next_batch_to_run()
@@ -1108,14 +1111,13 @@ class Scheduler(
             if disable_overlap_for_batch or need_grammar_sync:
                 pop_and_process()
 
+            # Start next async prefetch BEFORE GPU computation or idle check
+            # This ensures we always have a prefetch running to receive new requests
+            if self.enable_async_input_processing:
+                self._start_prefetch_if_needed()
+
             batch_result = None
             if batch:
-                # Start next async prefetch BEFORE GPU computation
-                # This allows I/O (recv_requests) to overlap with GPU computation
-                # Note: process_input_requests still runs in main thread at start of next iteration
-                if self.enable_async_input_processing:
-                    self._start_prefetch_if_needed()
-
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
