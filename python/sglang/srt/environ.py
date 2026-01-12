@@ -192,6 +192,7 @@ class Envs:
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    SGLANG_ENABLE_ASYNC_INPUT_PROCESSING = EnvBool(False)  # Enable async request receiving and processing to overlap with GPU computation
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")

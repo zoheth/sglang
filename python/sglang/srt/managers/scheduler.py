@@ -957,6 +957,16 @@ class Scheduler(
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
+        # Initialize async request processing components
+        self.enable_async_input_processing = envs.SGLANG_ENABLE_ASYNC_INPUT_PROCESSING.get()
+        if self.enable_async_input_processing:
+            from concurrent.futures import ThreadPoolExecutor
+
+            # Thread pool for async request receiving (single thread)
+            self.prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="req_prefetch")
+            # Future object for the current prefetch task
+            self.prefetch_future = None
+
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
@@ -1001,6 +1011,50 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
+    def _recv_requests_async(self):
+        """
+        Background thread function to receive requests asynchronously.
+        ONLY does I/O operations, does NOT modify scheduler state to avoid race conditions.
+        State modifications are done in the main thread via process_input_requests().
+
+        Thread safety analysis:
+        - recv_requests() may read self.last_batch.forward_mode for recv_skipper
+        - This read happens concurrently with main thread potentially updating self.last_batch
+        - Python GIL provides atomicity for attribute reads, so no crash/corruption
+        - Worst case: recv_skipper reads stale forward_mode, causing suboptimal skip decision
+        - Impact: One extra/missing recv attempt, self-corrects in next iteration
+        - Trade-off: Acceptable for the performance gain of overlapping I/O with GPU compute
+        """
+        return self.recv_requests()
+
+    def _start_prefetch_if_needed(self):
+        """Start async prefetch task if not already running."""
+        if not self.enable_async_input_processing:
+            return
+
+        # Only start new prefetch if no task is running
+        if self.prefetch_future is None or self.prefetch_future.done():
+            self.prefetch_future = self.prefetch_executor.submit(
+                self._recv_requests_async
+            )
+
+    def _wait_and_get_prefetch_result(self):
+        """Wait for the prefetch task to complete and return the received requests."""
+        if self.prefetch_future is not None:
+            try:
+                # Wait for the prefetch task to complete and get the result
+                recv_reqs = self.prefetch_future.result(timeout=10.0)  # 10s timeout
+                return recv_reqs
+            except Exception as e:
+                logger.error(f"Error in async request receiving: {e}")
+                import traceback
+                traceback.print_exc()
+                return []
+            finally:
+                self.prefetch_future = None
+        else:
+            return []
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1014,8 +1068,18 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        # Start the first prefetch task
+        if self.enable_async_input_processing:
+            self._start_prefetch_if_needed()
+
         while True:
-            recv_reqs = self.recv_requests()
+            # Get requests: either from async prefetch or synchronous recv
+            if self.enable_async_input_processing:
+                recv_reqs = self._wait_and_get_prefetch_result()
+            else:
+                recv_reqs = self.recv_requests()
+
+            # IMPORTANT: Always process requests in main thread to avoid race conditions
             self.process_input_requests(recv_reqs)
 
             if self._engine_paused:
@@ -1046,6 +1110,12 @@ class Scheduler(
 
             batch_result = None
             if batch:
+                # Start next async prefetch BEFORE GPU computation
+                # This allows I/O (recv_requests) to overlap with GPU computation
+                # Note: process_input_requests still runs in main thread at start of next iteration
+                if self.enable_async_input_processing:
+                    self._start_prefetch_if_needed()
+
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
