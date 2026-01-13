@@ -1398,10 +1398,55 @@ def get_zmq_socket_on_host(
     return port, socket
 
 
-def send_pyarrow(socket: zmq.Socket, obj: Any, flags: int = 0, protocol: int = -1, copy: bool = True) -> None:
-    """Send a Python object using PyArrow serialization.
+def _msgpack_default(obj):
+    """Default handler for msgpack serialization of custom objects."""
+    from enum import Enum
 
-    PyArrow serialization releases the GIL during deserialization, which can improve
+    # Handle dataclasses
+    if hasattr(obj, "__dataclass_fields__"):
+        return {
+            "__dataclass__": obj.__class__.__module__ + "." + obj.__class__.__qualname__,
+            "data": dataclasses.asdict(obj),
+        }
+    # Handle Enum
+    elif isinstance(obj, Enum):
+        return {
+            "__enum__": obj.__class__.__module__ + "." + obj.__class__.__qualname__,
+            "value": obj.value,
+        }
+    # Fallback to pickle for unsupported types
+    else:
+        return {
+            "__pickle__": True,
+            "data": pickle.dumps(obj),
+        }
+
+
+def _msgpack_object_hook(obj):
+    """Object hook for msgpack deserialization of custom objects."""
+    if isinstance(obj, dict):
+        # Handle dataclass
+        if "__dataclass__" in obj:
+            module_name, class_name = obj["__dataclass__"].rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            cls = getattr(module, class_name)
+            return cls(**obj["data"])
+        # Handle Enum
+        elif "__enum__" in obj:
+            module_name, class_name = obj["__enum__"].rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            enum_cls = getattr(module, class_name)
+            return enum_cls(obj["value"])
+        # Handle pickled objects
+        elif "__pickle__" in obj:
+            return pickle.loads(obj["data"])
+    return obj
+
+
+def send_pyarrow(socket: zmq.Socket, obj: Any, flags: int = 0, protocol: int = -1, copy: bool = True) -> None:
+    """Send a Python object using msgpack serialization.
+
+    msgpack's C extension releases the GIL during deserialization, which can improve
     performance in multi-threaded scenarios compared to pickle-based send_pyobj.
 
     Args:
@@ -1411,20 +1456,20 @@ def send_pyarrow(socket: zmq.Socket, obj: Any, flags: int = 0, protocol: int = -
         protocol: Unused, kept for compatibility with send_pyobj.
         copy: Unused, kept for compatibility with send_pyobj.
     """
-    import pyarrow as pa
+    import msgpack
 
-    # Serialize using PyArrow
-    serialized = pa.serialize(obj).to_buffer()
+    # Serialize using msgpack (use raw=False for string/bytes distinction)
+    serialized = msgpack.packb(obj, default=_msgpack_default, use_bin_type=True)
 
     # Send as bytes
     socket.send(serialized, flags=flags)
 
 
 def recv_pyarrow(socket: zmq.Socket, flags: int = 0) -> Any:
-    """Receive a Python object using PyArrow deserialization.
+    """Receive a Python object using msgpack deserialization.
 
-    PyArrow deserialization releases the GIL, which can improve performance
-    in multi-threaded scenarios compared to pickle-based recv_pyobj.
+    msgpack's C extension releases the GIL during deserialization, which can improve
+    performance in multi-threaded scenarios compared to pickle-based recv_pyobj.
 
     Args:
         socket: ZeroMQ socket to receive from.
@@ -1433,34 +1478,34 @@ def recv_pyarrow(socket: zmq.Socket, flags: int = 0) -> Any:
     Returns:
         The deserialized Python object.
     """
-    import pyarrow as pa
+    import msgpack
 
     # Receive bytes
     msg = socket.recv(flags=flags)
 
-    # Deserialize using PyArrow (releases GIL)
-    obj = pa.deserialize(msg)
+    # Deserialize using msgpack (releases GIL in C extension)
+    obj = msgpack.unpackb(msg, object_hook=_msgpack_object_hook, raw=False, strict_map_key=False)
 
     return obj
 
 
 class PyArrowSocketWrapper:
-    """Wrapper for ZeroMQ socket that uses PyArrow serialization.
+    """Wrapper for ZeroMQ socket that uses msgpack serialization.
 
-    This wrapper provides send_pyobj/recv_pyobj methods that use PyArrow
-    serialization instead of pickle, which can release the GIL during
-    deserialization for better performance in multi-threaded scenarios.
+    This wrapper provides send_pyobj/recv_pyobj methods that use msgpack
+    serialization instead of pickle. msgpack's C extension can release the GIL
+    during deserialization for better performance in multi-threaded scenarios.
     """
 
     def __init__(self, socket: zmq.Socket):
         self._socket = socket
 
     def send_pyobj(self, obj: Any, flags: int = 0, protocol: int = -1) -> None:
-        """Send a Python object using PyArrow serialization."""
+        """Send a Python object using msgpack serialization."""
         send_pyarrow(self._socket, obj, flags=flags, protocol=protocol)
 
     def recv_pyobj(self, flags: int = 0) -> Any:
-        """Receive a Python object using PyArrow deserialization."""
+        """Receive a Python object using msgpack deserialization."""
         return recv_pyarrow(self._socket, flags=flags)
 
     def __getattr__(self, name: str) -> Any:
