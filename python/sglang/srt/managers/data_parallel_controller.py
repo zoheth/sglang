@@ -51,6 +51,7 @@ from sglang.srt.tracing.trace import (
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
+    PyArrowSocketWrapper,
     bind_port,
     configure_ipv6,
     configure_logger,
@@ -139,9 +140,11 @@ class DataParallelController:
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
+            recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            # Wrap with PyArrow for GIL-free deserialization
+            self.recv_from_tokenizer = PyArrowSocketWrapper(recv_from_tokenizer)
 
         # Dispatch method
         self.round_robin_counter = 0

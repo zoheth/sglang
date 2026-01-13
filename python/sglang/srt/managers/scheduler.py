@@ -171,6 +171,7 @@ from sglang.srt.tracing.trace import (
 )
 from sglang.srt.utils import (
     DynamicGradMode,
+    PyArrowSocketWrapper,
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
@@ -620,12 +621,16 @@ class Scheduler(
                 self.socket.send_pyobj(output)
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
+            recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
-            self.recv_from_rpc = get_zmq_socket(
+            # Wrap with PyArrow for GIL-free deserialization
+            self.recv_from_tokenizer = PyArrowSocketWrapper(recv_from_tokenizer)
+            recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
+            # Wrap with PyArrow for GIL-free deserialization
+            self.recv_from_rpc = PyArrowSocketWrapper(recv_from_rpc)
 
             send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False

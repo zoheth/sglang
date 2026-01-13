@@ -47,7 +47,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_process_tree
+from sglang.srt.utils import PyArrowSocketWrapper, get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
@@ -326,12 +326,16 @@ class MultiTokenizerRouter:
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        self.send_to_scheduler = get_zmq_socket(
+        send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
-        self.receive_from_worker = get_zmq_socket(
+        # Wrap with PyArrow for GIL-free serialization
+        self.send_to_scheduler = PyArrowSocketWrapper(send_to_scheduler)
+        receive_from_worker = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_worker_ipc_name, True
         )
+        # Wrap with PyArrow for GIL-free deserialization
+        self.receive_from_worker = PyArrowSocketWrapper(receive_from_worker)
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()

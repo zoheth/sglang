@@ -1398,6 +1398,76 @@ def get_zmq_socket_on_host(
     return port, socket
 
 
+def send_pyarrow(socket: zmq.Socket, obj: Any, flags: int = 0, protocol: int = -1, copy: bool = True) -> None:
+    """Send a Python object using PyArrow serialization.
+
+    PyArrow serialization releases the GIL during deserialization, which can improve
+    performance in multi-threaded scenarios compared to pickle-based send_pyobj.
+
+    Args:
+        socket: ZeroMQ socket to send through.
+        obj: Python object to serialize and send.
+        flags: ZeroMQ send flags (e.g., zmq.NOBLOCK).
+        protocol: Unused, kept for compatibility with send_pyobj.
+        copy: Unused, kept for compatibility with send_pyobj.
+    """
+    import pyarrow as pa
+
+    # Serialize using PyArrow
+    serialized = pa.serialize(obj).to_buffer()
+
+    # Send as bytes
+    socket.send(serialized, flags=flags)
+
+
+def recv_pyarrow(socket: zmq.Socket, flags: int = 0) -> Any:
+    """Receive a Python object using PyArrow deserialization.
+
+    PyArrow deserialization releases the GIL, which can improve performance
+    in multi-threaded scenarios compared to pickle-based recv_pyobj.
+
+    Args:
+        socket: ZeroMQ socket to receive from.
+        flags: ZeroMQ recv flags (e.g., zmq.NOBLOCK).
+
+    Returns:
+        The deserialized Python object.
+    """
+    import pyarrow as pa
+
+    # Receive bytes
+    msg = socket.recv(flags=flags)
+
+    # Deserialize using PyArrow (releases GIL)
+    obj = pa.deserialize(msg)
+
+    return obj
+
+
+class PyArrowSocketWrapper:
+    """Wrapper for ZeroMQ socket that uses PyArrow serialization.
+
+    This wrapper provides send_pyobj/recv_pyobj methods that use PyArrow
+    serialization instead of pickle, which can release the GIL during
+    deserialization for better performance in multi-threaded scenarios.
+    """
+
+    def __init__(self, socket: zmq.Socket):
+        self._socket = socket
+
+    def send_pyobj(self, obj: Any, flags: int = 0, protocol: int = -1) -> None:
+        """Send a Python object using PyArrow serialization."""
+        send_pyarrow(self._socket, obj, flags=flags, protocol=protocol)
+
+    def recv_pyobj(self, flags: int = 0) -> Any:
+        """Receive a Python object using PyArrow deserialization."""
+        return recv_pyarrow(self._socket, flags=flags)
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate all other attributes to the underlying socket."""
+        return getattr(self._socket, name)
+
+
 def config_socket(socket, socket_type: zmq.SocketType):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3

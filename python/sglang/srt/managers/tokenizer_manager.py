@@ -97,6 +97,7 @@ from sglang.srt.tracing.trace import (
     trace_slice_start,
 )
 from sglang.srt.utils import (
+    PyArrowSocketWrapper,
     configure_gc_warning,
     dataclass_to_string_truncated,
     freeze_gc,
@@ -273,9 +274,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         if self.server_args.tokenizer_worker_num == 1:
-            self.send_to_scheduler = get_zmq_socket(
+            send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
+            # Wrap with PyArrow for GIL-free serialization
+            self.send_to_scheduler = PyArrowSocketWrapper(send_to_scheduler)
         else:
             from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
 
@@ -284,8 +287,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
 
+            # Wrap with PyArrow before passing to SenderWrapper
+            send_to_scheduler_wrapped = PyArrowSocketWrapper(send_to_scheduler)
             # Make sure that each request carries the tokenizer_ipc_name for response routing
-            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler_wrapped)
 
         # Request states
         self._chosen_loop = None

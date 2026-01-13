@@ -50,6 +50,7 @@ dependencies = [
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",
+  "pyarrow>=10.0.0",
   "pybase64",
   "pydantic",
   "python-multipart",
