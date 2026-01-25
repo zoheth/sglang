@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y sudo && \
 # Set up oh-my-zsh for devuser
 RUN cp -r /root/.oh-my-zsh /home/devuser/.oh-my-zsh && \
     cp /root/.zshrc /home/devuser/.zshrc && \
-    cp /root/.vimrc /home/devuser/.vimrc && \
-    cp /root/.tmux.conf /home/devuser/.tmux.conf && \
+    # cp /root/.vimrc /home/devuser/.vimrc && \
+    # cp /root/.tmux.conf /home/devuser/.tmux.conf && \
     sed -i 's|/root/.oh-my-zsh|/home/devuser/.oh-my-zsh|g' /home/devuser/.zshrc && \
     chown -R devuser:devuser /home/devuser/
 
@@ -28,8 +28,14 @@ RUN chown -R devuser:devuser /sgl-workspace
 # Switch to devuser
 USER devuser
 
+ENV http_proxy=http://host.docker.internal:7890
+ENV https_proxy=http://host.docker.internal:7890
+
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+ENV http_proxy=""
+ENV https_proxy=""
