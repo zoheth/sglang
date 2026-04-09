@@ -2355,6 +2355,92 @@ class Scheduler(
 
         return ret
 
+    def _get_new_batch_prefill_hisparse(self) -> Optional[ScheduleBatch]:
+        """HiSparse-specific prefill admission.
+
+        HiSparse offloads KV cache to host memory after prefill, so the GPU
+        only needs enough space for one chunk at a time. We bypass the normal
+        PrefillAdder token-budget system and only check:
+          1. There is a chunked request in progress, OR a waiting request.
+          2. The GPU can fit one chunk (chunked_prefill_size + page overhead).
+          3. max_running_requests is not exceeded (for new requests).
+        """
+        if len(self.waiting_queue) == 0 and self.chunked_req is None:
+            return None
+
+        running_bs = len(self.running_batch.reqs)
+
+        # Check GPU has space for one chunk
+        available = self.token_to_kv_pool_allocator.available_size()
+        chunk_budget = min(self.chunked_prefill_size, available - self.page_size)
+        if chunk_budget <= 0:
+            return None
+
+        can_run_list = []
+
+        # Continue chunked request if one is in progress
+        if self.chunked_req is not None:
+            req = self.chunked_req
+            req.init_next_round_input()
+            extend_len = min(req.extend_input_len, chunk_budget)
+            truncated = req.extend_input_len > extend_len
+            # Page-align the truncated length
+            extend_len = (extend_len // self.page_size) * self.page_size
+            if extend_len <= 0:
+                return None
+            req.set_extend_input_len(extend_len)
+            req.fill_ids = req.fill_ids[: len(req.prefix_indices) + extend_len]
+            can_run_list.append(req)
+            if truncated:
+                req.is_chunked += 1
+                # chunked_req stays set
+            else:
+                self.chunked_req = None
+        elif len(self.waiting_queue) > 0:
+            # Admit one new request (respecting max_running_requests)
+            if self.get_num_allocatable_reqs(running_bs) <= 0:
+                return None
+
+            # Check prefill_max_requests limit
+            if (x := self.server_args.prefill_max_requests) is not None and len(can_run_list) >= x:
+                return None
+
+            req = self.waiting_queue[0]
+            req.init_next_round_input(self.tree_cache)
+            extend_len = min(req.extend_input_len, chunk_budget)
+            truncated = req.extend_input_len > extend_len
+            if truncated:
+                extend_len = (extend_len // self.page_size) * self.page_size
+                if extend_len <= 0:
+                    return None
+                req.set_extend_input_len(extend_len)
+                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + extend_len]
+                self.chunked_req = req
+                req.is_chunked += 1
+
+            can_run_list.append(req)
+            self.waiting_queue = self.waiting_queue[1:]
+
+        if not can_run_list:
+            return None
+
+        self.can_run_list = can_run_list
+        self.running_bs = running_bs
+
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            chunked_req=self.chunked_req,
+        )
+
+        new_batch.prepare_for_extend()
+        return new_batch
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2366,6 +2452,10 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
+
+        # HiSparse: bypass the normal token-budget system
+        if self.enable_hisparse:
+            return self._get_new_batch_prefill_hisparse()
 
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -2424,7 +2514,6 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
-            enable_hisparse=self.enable_hisparse,
         )
 
         if self.chunked_req is not None:

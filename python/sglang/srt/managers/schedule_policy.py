@@ -389,7 +389,6 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
-        enable_hisparse: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -399,7 +398,6 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
-        self.enable_hisparse = enable_hisparse
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -447,10 +445,6 @@ class PrefillAdder:
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        # HiSparse offloads KV cache to host memory during decode,
-        # so no GPU KV reservation is needed for running requests.
-        if self.enable_hisparse:
-            return 0
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
@@ -588,13 +582,11 @@ class PrefillAdder:
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
-        # HiSparse offloads KV to host, no GPU reservation needed.
-        if self.enable_hisparse or truncated:
-            max_new_tokens = 0
-        else:
-            max_new_tokens = min(
-                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-            )
+        max_new_tokens = (
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            if not truncated
+            else 0
+        )
         self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
 
         # Return based on remaining token availability
@@ -618,13 +610,15 @@ class PrefillAdder:
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
-        if self.enable_hisparse or truncated:
-            reserve_new_tokens = 0
-        else:
-            reserve_new_tokens = min(
-                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-            )
-        self._update_prefill_budget(0, req.extend_input_len, reserve_new_tokens)
+        self._update_prefill_budget(
+            0,
+            req.extend_input_len,
+            (
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                if not truncated
+                else 0
+            ),
+        )
 
         # Return if chunked prefill not finished
         return req if truncated else None
@@ -714,9 +708,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
-                0 if self.enable_hisparse else min(
-                    req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-                ),
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -759,19 +751,10 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        if self.enable_hisparse:
-            # HiSparse offloads KV to host after each chunk, so we only need
-            # GPU space for one chunk at a time, not the full input.
-            # Add page_size overhead to match what alloc_extend actually needs.
-            total_tokens = req.extend_input_len
-            if self.rem_chunk_tokens is not None:
-                total_tokens = min(total_tokens, self.rem_chunk_tokens)
-            total_tokens += self.page_size
-        else:
-            total_tokens = req.extend_input_len + min(
-                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-                CLIP_MAX_NEW_TOKENS,
-            )
+        total_tokens = req.extend_input_len + min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
@@ -779,18 +762,6 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
-            if self.enable_hisparse:
-                logger.info(
-                    "HiSparse NO_TOKEN: total_tokens=%d, rem_total_tokens=%d, "
-                    "available_size=%d, evictable=%d, rem_total_token_offset=%d, "
-                    "running_bs=%d, can_run=%d",
-                    total_tokens, self.rem_total_tokens,
-                    self.token_to_kv_pool_allocator.available_size(),
-                    self.tree_cache.evictable_size(),
-                    self.rem_total_token_offset,
-                    len(self.running_batch.reqs) if self.running_batch else 0,
-                    len(self.can_run_list),
-                )
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
@@ -837,7 +808,7 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    0 if self.enable_hisparse else min(
+                    min(
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
