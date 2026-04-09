@@ -762,9 +762,11 @@ class PrefillAdder:
         if self.enable_hisparse:
             # HiSparse offloads KV to host after each chunk, so we only need
             # GPU space for one chunk at a time, not the full input.
+            # Add page_size overhead to match what alloc_extend actually needs.
             total_tokens = req.extend_input_len
             if self.rem_chunk_tokens is not None:
                 total_tokens = min(total_tokens, self.rem_chunk_tokens)
+            total_tokens += self.page_size
         else:
             total_tokens = req.extend_input_len + min(
                 max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
