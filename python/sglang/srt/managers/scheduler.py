@@ -2374,8 +2374,15 @@ class Scheduler(
         # Check GPU has space for one chunk.
         # Reserve: page_size for alloc_extend overhead + running_bs for decode tokens.
         available = self.token_to_kv_pool_allocator.available_size()
+        logical_avail = self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
+        hisparse_avail = self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
         reserved = self.page_size + running_bs
         chunk_budget = min(self.chunked_prefill_size, available - reserved)
+        logger.info(
+            "HiSparse prefill check: logical_avail=%d, hisparse_avail=%d, "
+            "available=%d, reserved=%d, chunk_budget=%d, running_bs=%d",
+            logical_avail, hisparse_avail, available, reserved, chunk_budget, running_bs,
+        )
         if chunk_budget <= 0:
             return None
 
