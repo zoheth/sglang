@@ -198,6 +198,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.observability.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
     PrefillStats,
@@ -2439,6 +2440,17 @@ class Scheduler(
         )
 
         new_batch.prepare_for_extend()
+
+        # Build prefill stats for logging
+        new_batch.prefill_stats = PrefillStats(
+            log_input_tokens=sum(r.extend_input_len for r in can_run_list),
+            log_hit_tokens=0,
+            new_token_ratio=self.new_token_ratio,
+            num_running_reqs=QueueCount.from_reqs(
+                self.running_batch.reqs, self.enable_priority_scheduling
+            ),
+            num_new_seqs=len(can_run_list),
+        )
         return new_batch
 
     def _get_new_batch_prefill_raw(
