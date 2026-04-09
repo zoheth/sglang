@@ -2371,9 +2371,11 @@ class Scheduler(
 
         running_bs = len(self.running_batch.reqs)
 
-        # Check GPU has space for one chunk
+        # Check GPU has space for one chunk.
+        # Reserve: page_size for alloc_extend overhead + running_bs for decode tokens.
         available = self.token_to_kv_pool_allocator.available_size()
-        chunk_budget = min(self.chunked_prefill_size, available - self.page_size)
+        reserved = self.page_size + running_bs
+        chunk_budget = min(self.chunked_prefill_size, available - reserved)
         if chunk_budget <= 0:
             return None
 
