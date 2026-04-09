@@ -760,8 +760,11 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req)
 
         if self.enable_hisparse:
-            # HiSparse offloads KV to host after prefill, only need GPU space for prefill.
+            # HiSparse offloads KV to host after each chunk, so we only need
+            # GPU space for one chunk at a time, not the full input.
             total_tokens = req.extend_input_len
+            if self.rem_chunk_tokens is not None:
+                total_tokens = min(total_tokens, self.rem_chunk_tokens)
         else:
             total_tokens = req.extend_input_len + min(
                 max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
