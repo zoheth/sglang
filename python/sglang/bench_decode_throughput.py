@@ -45,9 +45,15 @@ def send_one_request(
         "stream": True,
     }
 
-    token_timestamps = []
+    # Each SSE chunk corresponds to one decode step. With speculative decoding
+    # (MTP), one step accepts multiple tokens but still emits a single chunk,
+    # so we diff the cumulative meta_info.completion_tokens to get the real
+    # per-step token count. Note: output_ids in default (non-incremental)
+    # streaming mode is the full cumulative list, NOT a delta — do not count it.
+    token_timestamps = []  # list of (timestamp, tokens_in_this_step)
     first_token_time = None
-    num_output_tokens = 0
+    prev_completion_tokens = 0
+    final_meta_info = {}
 
     with requests.post(url, json=payload, stream=True) as resp:
         resp.raise_for_status()
@@ -56,18 +62,26 @@ def send_one_request(
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
             data = json.loads(line[len("data: "):])
-            if "text" in data:
-                t = time.perf_counter()
-                num_output_tokens += 1
-                token_timestamps.append(t)
+            if "text" not in data:
+                continue
+            t = time.perf_counter()
+            meta = data.get("meta_info", {})
+            cur_completion = meta.get("completion_tokens", prev_completion_tokens + 1)
+            step_tokens = cur_completion - prev_completion_tokens
+            prev_completion_tokens = cur_completion
+            if step_tokens > 0:
+                token_timestamps.append((t, step_tokens))
                 if first_token_time is None:
                     first_token_time = t
+            # The final chunk carries server-computed spec metrics.
+            final_meta_info = meta
 
     return {
         "req_id": req_id,
         "first_token_time": first_token_time,
         "token_timestamps": token_timestamps,
-        "num_output_tokens": num_output_tokens,
+        "num_output_tokens": prev_completion_tokens,
+        "meta_info": final_meta_info,
     }
 
 
@@ -111,13 +125,18 @@ def run_benchmark(args):
     last_prefill_done = max(r["first_token_time"] for r in valid_results)
     first_prefill_done = min(r["first_token_time"] for r in valid_results)
 
-    # Count tokens generated AFTER all prefills are done (pure decode phase)
+    # Count tokens generated AFTER all prefills are done (pure decode phase).
+    # Each entry is (timestamp, tokens_in_this_step) — with MTP one step can
+    # emit multiple tokens in a single SSE chunk. decode_steps counts chunks
+    # so we can compute the spec-decode accept rate (tokens / step).
     decode_tokens = 0
+    decode_steps = 0
     decode_end_time = 0.0
     for r in valid_results:
-        for ts in r["token_timestamps"]:
+        for ts, step_tokens in r["token_timestamps"]:
             if ts > last_prefill_done:
-                decode_tokens += 1
+                decode_tokens += step_tokens
+                decode_steps += 1
                 decode_end_time = max(decode_end_time, ts)
 
     total_tokens = sum(r["num_output_tokens"] for r in valid_results)
@@ -134,12 +153,37 @@ def run_benchmark(args):
     print(f"Decode phase (after all prefills done):")
     print(f"  Duration:                  {decode_duration:.2f} s")
     print(f"  Tokens generated:          {decode_tokens}")
+    print(f"  Decode steps (chunks):     {decode_steps}")
+    if decode_steps > 0:
+        accept_len = decode_tokens / decode_steps
+        print(f"  Client-side tokens/step:   {accept_len:.3f}  "
+              f"(1.0 means no speculation)")
     print(f"  Decode batch size:         {args.num_requests}")
     if decode_duration > 0:
         throughput = decode_tokens / decode_duration
         per_req = throughput / args.num_requests
         print(f"  Throughput (total):        {throughput:.2f} tokens/s")
         print(f"  Throughput (per request):  {per_req:.2f} tokens/s")
+
+    # Server-side speculative-decoding metrics (authoritative when MTP is on).
+    spec_accept_lengths = [
+        r["meta_info"].get("spec_accept_length")
+        for r in valid_results
+        if r["meta_info"].get("spec_accept_length") is not None
+    ]
+    spec_accept_rates = [
+        r["meta_info"].get("spec_accept_rate")
+        for r in valid_results
+        if r["meta_info"].get("spec_accept_rate") is not None
+    ]
+    if spec_accept_lengths:
+        print()
+        print(f"Server-side spec-decoding metrics (avg across requests):")
+        print(f"  spec_accept_length:        "
+              f"{sum(spec_accept_lengths) / len(spec_accept_lengths):.3f}")
+        if spec_accept_rates:
+            print(f"  spec_accept_rate:          "
+                  f"{sum(spec_accept_rates) / len(spec_accept_rates):.3f}")
     print()
     print(f"Total output tokens:         {total_tokens}")
     print(f"Overall throughput:          {total_tokens / (t_end - t_start):.2f} tokens/s")
