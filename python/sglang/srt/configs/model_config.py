@@ -93,6 +93,51 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+def get_nsa_index_layer_mask(
+    config: PretrainedConfig,
+    start_layer: int,
+    num_layers: int,
+    is_draft_worker: bool = False,
+) -> Optional[List[bool]]:
+    """Per-layer mask of which layers run the NSA indexer (and need an
+    index_k cache slot). Mirrors the skip_topk logic in
+    `sglang.srt.models.deepseek_v2.DeepseekV2AttentionMLA.__init__` — keep
+    in sync. Returns None when the mask would be trivially all-True.
+    """
+    assert is_deepseek_nsa(config)
+    assert (
+        getattr(config, "loop_num", 1) == 1
+    ), "NSA index_layer_mask does not support loop_num > 1"
+
+    # Draft worker (nextn / MTP) layers always compute — mirrors the
+    # `is_nextn` branch in DeepseekV2AttentionMLA.__init__.
+    if is_draft_worker:
+        return None
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    freq = getattr(config, "index_topk_freq", 1)
+    if pattern is None and freq == 1:
+        return None
+
+    mask: List[bool] = []
+    for i in range(num_layers):
+        layer_id = start_layer + i
+        if pattern is not None and layer_id < len(pattern):
+            skip = pattern[layer_id] == "S"
+        else:
+            skip = max(layer_id - 1, 0) % freq != 0
+        # Global layer 0 has no predecessor, so forward_mla.py always
+        # computes it (`... or prev_topk_indices is None`). Force a real
+        # cache slot regardless of pattern/freq.
+        if layer_id == 0:
+            skip = False
+        mask.append(not skip)
+
+    if all(mask):
+        return None
+    return mask
+
+
 class ModelConfig:
     def __init__(
         self,

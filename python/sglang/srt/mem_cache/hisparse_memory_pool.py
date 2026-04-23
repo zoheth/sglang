@@ -1,7 +1,7 @@
 # mapping on device memory, host memory and memory allocator
 
 import weakref
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -44,6 +44,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
+        index_layer_mask: Optional[List[bool]] = None,
     ):
         super().__init__(
             size=size,
@@ -59,6 +60,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
+            index_layer_mask=index_layer_mask,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 

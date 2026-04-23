@@ -1823,6 +1823,18 @@ class NSAIndexerPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
     ):
+        # Host layout uses fixed per-layer strides and all-layer transfer
+        # kernels, which are incompatible with skip_topk's 1-byte placeholder
+        # device buffers. Fail loud instead of silently corrupting host memory.
+        index_layer_mask = getattr(device_pool, "index_layer_mask", None)
+        if index_layer_mask is not None and not all(index_layer_mask):
+            raise NotImplementedError(
+                "Hicache (NSAIndexerPoolHost) is not yet compatible with "
+                "NSA skip_topk layer masking (index_topk_pattern or "
+                "index_topk_freq > 1). Either disable hicache or disable the "
+                "skip_topk pattern."
+            )
+
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout

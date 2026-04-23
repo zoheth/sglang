@@ -1863,6 +1863,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        index_layer_mask: Optional[List[bool]] = None,
     ):
 
         override_dim = (
@@ -1895,31 +1896,60 @@ class NSATokenToKVPool(MLATokenToKVPool):
             assert self.page_size == 1
         else:
             assert self.page_size == 64
+
+        # skip_topk layers reuse the previous layer's topk indices and never
+        # touch index_k, so we allocate a 1-byte placeholder for them.
+        if index_layer_mask is not None:
+            assert len(index_layer_mask) == layer_num, (
+                f"index_layer_mask length {len(index_layer_mask)} does not "
+                f"match layer_num {layer_num}"
+            )
+        self.index_layer_mask = index_layer_mask
+
+        num_pages = (index_buf_size + page_size + 1) // self.page_size
+        page_stride = self.page_size * (
+            index_head_dim + index_head_dim // self.quant_block_size * 4
+        )
+        buf_dtype = self.index_k_with_scale_buffer_dtype
+
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
             else nullcontext()
         ):
-            self.index_k_with_scale_buffer = [
-                torch.zeros(
-                    # Layout:
-                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    (
-                        (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
-                        * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
-                        ),
-                    ),
-                    dtype=self.index_k_with_scale_buffer_dtype,
-                    device=device,
-                )
-                for _ in range(layer_num)
-            ]
+            # Layout:
+            #     ref: test_attention.py :: kv_cache_cast_to_fp8
+            #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
+            #     data: for page i,
+            #         * buf[i, :page_size * head_dim] for fp8 data
+            #         * buf[i, page_size * head_dim:].view(float32) for scale
+            self.index_k_with_scale_buffer = []
+            for i in range(layer_num):
+                needs_cache = index_layer_mask is None or index_layer_mask[i]
+                if needs_cache:
+                    buf = torch.zeros(
+                        (num_pages, page_stride),
+                        dtype=buf_dtype,
+                        device=device,
+                    )
+                else:
+                    # Placeholder must stay a valid Tensor — downstream code
+                    # takes its data_ptr() indiscriminately.
+                    buf = torch.zeros(1, dtype=buf_dtype, device=device)
+                self.index_k_with_scale_buffer.append(buf)
+
+        if index_layer_mask is not None:
+            num_cached = sum(1 for m in index_layer_mask if m)
+            logger.info(
+                "NSA index_k cache: allocated %d/%d layers (skipping %d "
+                "skip_topk layers). Pages=%d, page_stride=%d bytes.",
+                num_cached,
+                layer_num,
+                layer_num - num_cached,
+                num_pages,
+                page_stride,
+            )
+
         self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
@@ -1996,21 +2026,31 @@ class NSATokenToKVPool(MLATokenToKVPool):
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
+    def _layer_has_index_cache(self, local_layer_idx: int) -> bool:
+        return self.index_layer_mask is None or self.index_layer_mask[local_layer_idx]
+
     def get_state_buf_infos(self):
+        # Skip placeholder layers — their 1-byte dummies must not be mirrored
+        # to host pools as real data.
+        layer_indices = [
+            i for i in range(self.layer_num) if self._layer_has_index_cache(i)
+        ]
         data_ptrs = [
-            self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
+            self.index_k_with_scale_buffer[i].data_ptr() for i in layer_indices
         ]
         data_lens = [
-            self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
+            self.index_k_with_scale_buffer[i].nbytes for i in layer_indices
         ]
         item_lens = [
-            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+            self.index_k_with_scale_buffer[i][0].nbytes for i in layer_indices
         ]
         return data_ptrs, data_lens, item_lens
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
-        for index_k_cache in self.index_k_with_scale_buffer:
+        for i, index_k_cache in enumerate(self.index_k_with_scale_buffer):
+            if not self._layer_has_index_cache(i):
+                continue
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
 

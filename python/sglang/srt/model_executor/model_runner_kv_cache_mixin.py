@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    get_nsa_index_layer_mask,
+    is_deepseek_nsa,
+)
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -425,6 +429,12 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                index_layer_mask=get_nsa_index_layer_mask(
+                    self.model_config.hf_config,
+                    start_layer=self.start_layer,
+                    num_layers=self.num_effective_layers,
+                    is_draft_worker=self.is_draft_worker,
+                ),
             )
             if self.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
