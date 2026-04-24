@@ -766,6 +766,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
+        # Rebuilt decode batches (e.g. hiSparse existing_decode_batch_to_run) start
+        # with prefix_lens=None; ForwardBatch.init_new asserts it is a list.
+        if not isinstance(batch.prefix_lens, list):
+            batch.prefix_lens = [
+                int(s) - l
+                for s, l in zip(batch.seq_lens_cpu.tolist(), batch.extend_lens)
+            ]
         batch.return_logprob = False
         batch.return_hidden_states = False
 
