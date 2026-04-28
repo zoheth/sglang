@@ -158,6 +158,20 @@ class EAGLEWorker(TpModelWorker):
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
+        # The draft ModelRunner.initialize() created its own HiSparseCoordinator
+        # because enable_hisparse is a process-wide server arg. That coordinator's
+        # host KV pool is never populated (admit_request_into_staging is only
+        # invoked on the scheduler/target coordinator), so swap_in_selected_pages
+        # would dereference uninitialized memory. Replace it with the target's
+        # coordinator so draft NSA decode reads from the populated host pool.
+        if (
+            target_worker.model_runner.hisparse_coordinator is not None
+            and self.model_runner.hisparse_coordinator is not target_worker.model_runner.hisparse_coordinator
+        ):
+            self.model_runner.hisparse_coordinator = (
+                target_worker.model_runner.hisparse_coordinator
+            )
+
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
         if self.speculative_algorithm.is_eagle3():
