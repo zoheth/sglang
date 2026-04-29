@@ -900,6 +900,7 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self.hisparse_eagle_draft_state: Optional[dict] = None
 
     @property
     def seqlen(self) -> int:

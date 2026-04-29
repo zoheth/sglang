@@ -2302,7 +2302,27 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
-        # todo hisparse, maybe other info to contain for the new batch
+
+        if (
+            not self.spec_algorithm.is_none()
+            and reqs
+            and reqs[0].hisparse_eagle_draft_state is not None
+        ):
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            states = [r.hisparse_eagle_draft_state for r in reqs]
+            batch.spec_info = EagleDraftInput(
+                topk_p=torch.stack([s["topk_p"] for s in states]),
+                topk_index=torch.stack([s["topk_index"] for s in states]),
+                hidden_states=torch.stack([s["hidden_states"] for s in states]),
+                verified_id=torch.stack([s["verified_id"] for s in states]),
+                capture_hidden_mode=states[0]["capture_hidden_mode"],
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+            for r in reqs:
+                r.hisparse_eagle_draft_state = None
+
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:

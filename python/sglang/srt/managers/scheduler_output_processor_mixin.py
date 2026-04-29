@@ -201,6 +201,18 @@ class SchedulerOutputProcessorMixin:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
+                            if (
+                                not self.spec_algorithm.is_none()
+                                and batch.spec_info is not None
+                            ):
+                                draft = batch.spec_info
+                                req.hisparse_eagle_draft_state = {
+                                    "topk_p": draft.topk_p[i].clone(),
+                                    "topk_index": draft.topk_index[i].clone(),
+                                    "hidden_states": draft.hidden_states[i].clone(),
+                                    "verified_id": draft.verified_id[i].clone(),
+                                    "capture_hidden_mode": draft.capture_hidden_mode,
+                                }
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
