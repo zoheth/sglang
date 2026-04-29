@@ -274,23 +274,27 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert need_size % self.page_size == 0
         before = _hisparse_pool_avail(self)
         n_alloc_in = len(allocated_indices)
-        # Read the prefill mapping but DO NOT clear it: subsequent alloc_extend
-        # calls (e.g. spec-mode verify) read mapping[last_prefill_loc] as
-        # hisparse_last_loc; clearing it would force the kernel to write into
-        # page 0 (the sentinel page) and corrupt the pool. Stale mapping for
-        # any prefill slots not retained in the device buffer is acceptable —
-        # those slots will be reallocated and the mapping overwritten.
-        hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        # Filter valid (non-zero) hisparse indices.
-        # In the direct-to-host path, mapping is all zeros since no hisparse
-        # device indices were pre-allocated.
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
+        # Read prefill mapping. We keep mapping for L positions whose hisparse
+        # slot is retained in the device buffer (subsequent alloc_extend reads
+        # mapping[last_prefill_loc] as hisparse_last_loc — clearing it forces
+        # the kernel to write into page 0 and corrupt the pool). For L positions
+        # whose hisparse slot is freed back to the pool below, we clear mapping
+        # so request_finished does not double-free those slots.
+        hisparse_indices_raw = self.full_to_hisparse_device_index_mapping[
+            allocated_indices
+        ]
+        hisparse_indices = hisparse_indices_raw[hisparse_indices_raw > 0]
         n_reused = int(hisparse_indices.numel())
         n_extra = 0
         n_residual = 0
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
             self.free_hisparse_indices(hisparse_indices[need_size:])
+            # Clear mapping for L positions whose hisparse slot was freed.
+            tail_mask = ~torch.isin(hisparse_indices_raw, buffer_indices)
+            self.full_to_hisparse_device_index_mapping[
+                allocated_indices[tail_mask]
+            ] = 0
         else:
             # page alignment, claiming the residual space for an incomplete page
             page_residual_length = len(hisparse_indices) % self.page_size
