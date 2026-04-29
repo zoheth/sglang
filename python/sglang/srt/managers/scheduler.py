@@ -2288,6 +2288,10 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
+        batch.prefix_lens = list(seq_lens)
+        batch.extend_lens = [1] * len(reqs)
+        batch.extend_logprob_start_lens = [0] * len(reqs)
+        batch.extend_num_tokens = len(reqs)
         # output_ids = last generated token, used as input_ids by prepare_for_decode
         batch.output_ids = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
