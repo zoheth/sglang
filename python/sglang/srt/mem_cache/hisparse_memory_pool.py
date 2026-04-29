@@ -1,5 +1,6 @@
 # mapping on device memory, host memory and memory allocator
 
+import os
 import weakref
 from typing import List, Optional
 
@@ -123,6 +124,46 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
 
 
+_HISPARSE_TRACE = os.environ.get("SGL_HISPARSE_POOL_TRACE", "0") == "1"
+_HISPARSE_TRACE_OP_ID = 0
+
+
+def _hisparse_trace(allocator, op: str, before, after, **info):
+    if not _HISPARSE_TRACE:
+        return
+    global _HISPARSE_TRACE_OP_ID
+    _HISPARSE_TRACE_OP_ID += 1
+    caller = ""
+    try:
+        import traceback as _tb
+
+        stack = _tb.extract_stack()[:-2]
+        for frame in reversed(stack):
+            if "hisparse_memory_pool.py" in frame.filename:
+                continue
+            caller = f"{frame.filename.split('/')[-1]}:{frame.lineno}:{frame.name}"
+            break
+    except Exception:
+        pass
+    logical_before, hisparse_before = before
+    logical_after, hisparse_after = after
+    extras = " ".join(f"{k}={v}" for k, v in info.items())
+    print(
+        f"[HSP-TRACE #{_HISPARSE_TRACE_OP_ID:05d}] {op} "
+        f"L:{logical_before}->{logical_after}({logical_after-logical_before:+d}) "
+        f"H:{hisparse_before}->{hisparse_after}({hisparse_after-hisparse_before:+d}) "
+        f"{extras} <- {caller}",
+        flush=True,
+    )
+
+
+def _hisparse_pool_avail(allocator):
+    return (
+        allocator.logical_attn_allocator.available_size(),
+        allocator.hisparse_attn_allocator.available_size(),
+    )
+
+
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
         self,
@@ -210,7 +251,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         Used in the direct-to-host transfer path where KV data is written
         directly to host memory by the prefill node, skipping GPU staging.
         """
-        return self.logical_attn_allocator.alloc_extend(
+        before = _hisparse_pool_avail(self)
+        out = self.logical_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
@@ -218,9 +260,20 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
+        _hisparse_trace(
+            self,
+            "alloc_logical_only",
+            before,
+            _hisparse_pool_avail(self),
+            extend=extend_num_tokens,
+            out_len=(0 if out is None else len(out)),
+        )
+        return out
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
+        before = _hisparse_pool_avail(self)
+        n_alloc_in = len(allocated_indices)
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
@@ -228,6 +281,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
+        n_reused = int(hisparse_indices.numel())
+        n_extra = 0
+        n_residual = 0
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
             self.free_hisparse_indices(hisparse_indices[need_size:])
@@ -235,6 +291,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # page alignment, claiming the residual space for an incomplete page
             page_residual_length = len(hisparse_indices) % self.page_size
             if page_residual_length != 0:
+                n_residual = self.page_size - page_residual_length
                 hisparse_indices = torch.cat(
                     [
                         hisparse_indices,
@@ -254,13 +311,37 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             assert (
                 extra_indices is not None
             ), "Hisparse allocation failed in alloc_device_buffer"
+            n_extra = int(extra_indices.numel())
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
+        _hisparse_trace(
+            self,
+            "alloc_device_buffer",
+            before,
+            _hisparse_pool_avail(self),
+            need_size=need_size,
+            allocated_in=n_alloc_in,
+            reused=n_reused,
+            residual=n_residual,
+            extra=n_extra,
+            out_len=int(buffer_indices.numel()),
+        )
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
+        before = _hisparse_pool_avail(self)
+        n_in = int(buffer_indices.numel())
         # disable free group mechanism for device buffer free
         self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        kept = buffer_indices[buffer_indices > 0]
+        self.hisparse_attn_allocator.free(kept)
+        _hisparse_trace(
+            self,
+            "free_hisparse_indices",
+            before,
+            _hisparse_pool_avail(self),
+            in_len=n_in,
+            kept_len=int(kept.numel()),
+        )
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         hisparse_last_locs = self._kvcache._translate_loc_to_hisparse_device(last_locs)
@@ -276,6 +357,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
+        before = _hisparse_pool_avail(self)
 
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
@@ -284,11 +366,27 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             num_new_pages
             > self.logical_attn_allocator.available_size() // self.page_size
         ):
+            _hisparse_trace(
+                self,
+                "alloc_extend(FAIL_LOGICAL)",
+                before,
+                _hisparse_pool_avail(self),
+                extend=extend_num_tokens,
+                new_pages=num_new_pages,
+            )
             return None
         if (
             num_new_pages
             > self.hisparse_attn_allocator.available_size() // self.page_size
         ):
+            _hisparse_trace(
+                self,
+                "alloc_extend(FAIL_HISPARSE)",
+                before,
+                _hisparse_pool_avail(self),
+                extend=extend_num_tokens,
+                new_pages=num_new_pages,
+            )
             return None
 
         logical_indices = self.logical_attn_allocator.alloc_extend(
@@ -302,6 +400,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert logical_indices is not None, "Logical allocation failed in alloc_extend"
 
         hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
+        hisparse_last_loc_first = (
+            int(hisparse_last_loc[0].item()) if hisparse_last_loc.numel() > 0 else -1
+        )
+        last_loc_first = int(last_loc[0].item()) if last_loc.numel() > 0 else -1
         hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -313,6 +415,26 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert (
             hisparse_indices is not None
         ), "Hisparse allocation failed in alloc_extend"
+        _hisparse_trace(
+            self,
+            "alloc_extend",
+            before,
+            _hisparse_pool_avail(self),
+            extend=extend_num_tokens,
+            new_pages=num_new_pages,
+            last_loc=last_loc_first,
+            hisparse_last_loc=hisparse_last_loc_first,
+            log_len=int(logical_indices.numel()),
+            his_len=int(hisparse_indices.numel()),
+            log_first=(
+                int(logical_indices[0].item()) if logical_indices.numel() > 0 else -1
+            ),
+            his_first=(
+                int(hisparse_indices[0].item())
+                if hisparse_indices.numel() > 0
+                else -1
+            ),
+        )
 
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
 
@@ -324,10 +446,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
+        before = _hisparse_pool_avail(self)
         logical_indices = self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
-
+        _hisparse_trace(
+            self,
+            "alloc_decode",
+            before,
+            _hisparse_pool_avail(self),
+            bs=int(seq_lens.numel()),
+            out_len=(0 if logical_indices is None else int(logical_indices.numel())),
+        )
         return logical_indices
 
     def alloc_decode_debug(
@@ -355,10 +485,24 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return logical_indices
 
     def free_hisparse(self, free_indices: torch.Tensor):
+        before = _hisparse_pool_avail(self)
+        n_in = int(free_indices.numel())
         hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
+        n_pre_filter = int(hisparse_indices.numel())
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
+        n_post_filter = int(hisparse_indices.numel())
         self.free_hisparse_indices(hisparse_indices)
         self.full_to_hisparse_device_index_mapping[free_indices] = 0
+        _hisparse_trace(
+            self,
+            "free_hisparse",
+            before,
+            _hisparse_pool_avail(self),
+            free_in=n_in,
+            translated=n_pre_filter,
+            kept=n_post_filter,
+            log_first=int(free_indices[0].item()) if n_in > 0 else -1,
+        )
 
     def clear(self):
         self.logical_attn_allocator.clear()
@@ -370,15 +514,20 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
     def backup_state(self):
-        return (
+        before = _hisparse_pool_avail(self)
+        out = (
             self.logical_attn_allocator.backup_state(),
             self.hisparse_attn_allocator.backup_state(),
         )
+        _hisparse_trace(self, "backup_state", before, _hisparse_pool_avail(self))
+        return out
 
     def restore_state(self, state):
+        before = _hisparse_pool_avail(self)
         logical_state, hisparse_state = state
         self.logical_attn_allocator.restore_state(logical_state)
         self.hisparse_attn_allocator.restore_state(hisparse_state)
+        _hisparse_trace(self, "restore_state", before, _hisparse_pool_avail(self))
 
     def free_group_begin(self):
         return
@@ -389,12 +538,24 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        before = _hisparse_pool_avail(self)
+        n_in = int(free_index.numel())
+        in_group = not self.is_not_in_free_group
 
         if self.is_not_in_free_group:
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
         else:
             self.free_group.append(free_index)
+        _hisparse_trace(
+            self,
+            "free",
+            before,
+            _hisparse_pool_avail(self),
+            n=n_in,
+            grouped=in_group,
+            log_first=int(free_index[0].item()) if n_in > 0 else -1,
+        )
         assert (
             self.logical_attn_allocator.available_size()
             <= self.logical_attn_allocator.size
