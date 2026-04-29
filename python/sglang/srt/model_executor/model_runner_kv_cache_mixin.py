@@ -440,10 +440,19 @@ class ModelRunnerKVCacheMixin:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 hisparse_cfg = parse_hisparse_config(self.server_args)
-                nsa_pool_kwargs["host_to_device_ratio"] = (
-                    hisparse_cfg.host_to_device_ratio
-                )
-                self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
+                if self.is_draft_worker:
+                    nsa_pool_kwargs["size"] = (
+                        self.max_total_num_tokens
+                        * hisparse_cfg.host_to_device_ratio
+                    )
+                    self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
+                else:
+                    nsa_pool_kwargs["host_to_device_ratio"] = (
+                        hisparse_cfg.host_to_device_ratio
+                    )
+                    self.token_to_kv_pool = HiSparseNSATokenToKVPool(
+                        **nsa_pool_kwargs
+                    )
             else:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:

@@ -686,7 +686,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.maybe_init_ngram_embedding()
 
         # Init hisparse coordinator (must happen before CUDA graph capture)
-        if self.enable_hisparse:
+        if self.enable_hisparse and not self.is_draft_worker:
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
