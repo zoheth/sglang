@@ -369,6 +369,17 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
+    def backup_state(self):
+        return (
+            self.logical_attn_allocator.backup_state(),
+            self.hisparse_attn_allocator.backup_state(),
+        )
+
+    def restore_state(self, state):
+        logical_state, hisparse_state = state
+        self.logical_attn_allocator.restore_state(logical_state)
+        self.hisparse_attn_allocator.restore_state(hisparse_state)
+
     def free_group_begin(self):
         return
 
