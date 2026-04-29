@@ -274,9 +274,13 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert need_size % self.page_size == 0
         before = _hisparse_pool_avail(self)
         n_alloc_in = len(allocated_indices)
-        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
+        # Read the prefill mapping but DO NOT clear it: subsequent alloc_extend
+        # calls (e.g. spec-mode verify) read mapping[last_prefill_loc] as
+        # hisparse_last_loc; clearing it would force the kernel to write into
+        # page 0 (the sentinel page) and corrupt the pool. Stale mapping for
+        # any prefill slots not retained in the device buffer is acceptable —
+        # those slots will be reallocated and the mapping overwritten.
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         # Filter valid (non-zero) hisparse indices.
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
