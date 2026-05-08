@@ -150,6 +150,10 @@ from sglang.srt.managers.mm_utils import (
     init_mm_embedding_cache,
     unwrap_shm_features,
 )
+from sglang.srt.managers.synthetic_decode import (
+    SyntheticDecodeReqInput,
+    SyntheticDecodeReqOutput,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
@@ -1453,8 +1457,23 @@ class Scheduler(
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
                 ),
+                (
+                    SyntheticDecodeReqInput,
+                    self.handle_synthetic_decode_request,
+                ),
             ]
         )
+
+    def handle_synthetic_decode_request(
+        self, recv_req: SyntheticDecodeReqInput
+    ) -> SyntheticDecodeReqOutput:
+        # Thin wrapper -- all logic lives in managers/synthetic_decode.py so
+        # rebases against upstream stay surgical.
+        from sglang.srt.managers.synthetic_decode import (
+            handle_synthetic_decode_request as _impl,
+        )
+
+        return _impl(self, recv_req)
 
     def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched,

@@ -79,6 +79,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.synthetic_decode import (
+    SyntheticDecodeReqInput,
+    SyntheticDecodeReqOutput,
+)
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
@@ -108,6 +112,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("inject_decode_batch", SyntheticDecodeReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -259,6 +264,40 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def inject_decode_batch(
+        self: TokenizerManager,
+        num_reqs: int,
+        seq_len: int,
+        decode_steps: int,
+    ) -> SyntheticDecodeReqOutput:
+        """Inject `num_reqs` synthetic decode-ready requests across all attn DP
+        ranks for decode-only performance benchmarking.
+
+        `num_reqs` is the GLOBAL total. Each scheduler computes its share from
+        attn_dp_rank. Ranks getting 0 reqs no-op (idle batch keeps lockstep).
+        See managers/synthetic_decode.py for the full implementation.
+        """
+        self.auto_create_handle_loop()
+        results = await self.inject_decode_batch_communicator(
+            SyntheticDecodeReqInput(
+                num_reqs=num_reqs,
+                seq_len=seq_len,
+                decode_steps=decode_steps,
+            )
+        )
+        # Aggregate per-rank results: success only if all ranks succeeded.
+        all_success = all(r.success for r in results)
+        messages = [
+            f"rank={i} n_local={r.n_local} {('ok' if r.success else 'FAIL: ' + r.message)}"
+            for i, r in enumerate(results)
+        ]
+        total_local = sum(r.n_local for r in results)
+        return SyntheticDecodeReqOutput(
+            success=all_success,
+            message="; ".join(messages),
+            n_local=total_local,
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

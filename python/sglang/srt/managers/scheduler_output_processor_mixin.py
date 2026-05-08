@@ -1009,6 +1009,11 @@ class SchedulerOutputProcessorMixin:
             if req is skip_req:
                 continue
 
+            # Synthetic decode-only injection (managers/synthetic_decode.py)
+            # has no HTTP client waiting; suppress streaming entirely.
+            if getattr(req, "is_synthetic", False):
+                continue
+
             if req.finished():
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice

@@ -639,6 +639,12 @@ class Req(ReqDllmMixin):
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
+        # Synthetic decode-only benchmark request (see managers/synthetic_decode.py).
+        # When True: prefix_indices is pre-allocated by the injector and must NOT
+        # be overwritten by match_prefix; output streaming is suppressed (no client
+        # is waiting). Default False; only the synthetic injector flips this on.
+        self.is_synthetic = False
+
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 

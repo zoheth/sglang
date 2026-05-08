@@ -85,6 +85,12 @@ def match_prefix_for_req(
     cow_mamba: bool = False,
     include_req: bool = False,
 ):
+    # Synthetic decode-only injection: prefix_indices is pre-allocated by
+    # managers/synthetic_decode.py and must not be re-resolved against the
+    # tree cache (the prefix tokens were never seen by any prior request).
+    if getattr(req, "is_synthetic", False):
+        return
+
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 

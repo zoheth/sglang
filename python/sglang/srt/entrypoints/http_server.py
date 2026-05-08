@@ -970,6 +970,38 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     )
 
 
+@app.post("/inject_decode_batch")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def inject_decode_batch_async(request: Request):
+    """Inject N synthetic decode-ready requests for decode-only benchmarking.
+
+    Body: {"num_reqs": int, "seq_len": int, "decode_steps": int}.
+    `num_reqs` is the global total across all attn DP ranks; each rank takes
+    its share. See managers/synthetic_decode.py for full semantics.
+    """
+    try:
+        body = await request.json()
+        num_reqs = int(body["num_reqs"])
+        seq_len = int(body["seq_len"])
+        decode_steps = int(body["decode_steps"])
+    except (KeyError, TypeError, ValueError) as e:
+        return ORJSONResponse(
+            {"success": False, "message": f"bad request body: {e}"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    ret = await _global_state.tokenizer_manager.inject_decode_batch(
+        num_reqs=num_reqs, seq_len=seq_len, decode_steps=decode_steps
+    )
+    return ORJSONResponse(
+        {
+            "success": ret.success,
+            "message": ret.message,
+            "n_local_total": ret.n_local,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_profile_async():
