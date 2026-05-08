@@ -980,6 +980,14 @@ class Req(ReqDllmMixin):
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
     ):
+        # Synthetic decode-only injection (managers/synthetic_decode.py) sets
+        # fill_ids, prefix_indices, extend_input_len, and extend_logprob_start_len
+        # itself before queuing. Re-running tree_cache.match_prefix here would
+        # wipe its pre-allocated prefix and silently leak those KV slots,
+        # turning the bootstrap into a full-seq prefill.
+        if getattr(self, "is_synthetic", False):
+            return
+
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
