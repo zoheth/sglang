@@ -190,7 +190,13 @@ def handle_synthetic_decode_request(
         # and prepare_for_extend treats `prefix_len` tokens as already cached.
         req.prefix_indices = prefix_indices_list[i]
         req.fill_ids = list(req.origin_input_ids)
-        req.extend_input_len = extend_len  # in [1, page_size]
+        # logprob_start_len = -1 + set_extend_input_len() makes
+        # extend_logprob_start_len = extend_input_len, which keeps the DP
+        # attention sync invariant `num_tokens_for_logprob == batch_size` for
+        # non-logprob extend reqs (otherwise the all-gather assertion in
+        # scheduler_dp_attn_mixin.prepare_mlp_sync_batch_raw fires).
+        req.logprob_start_len = -1
+        req.set_extend_input_len(extend_len)  # in [1, page_size]
         req.already_computed = prefix_len
         req.cached_tokens = prefix_len
 
