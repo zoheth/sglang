@@ -102,11 +102,6 @@ def handle_synthetic_decode_request(
 
     seq_len = recv_req.seq_len
     decode_steps = recv_req.decode_steps
-    if seq_len < 2:
-        return SyntheticDecodeReqOutput(
-            success=False,
-            message="seq_len must be >= 2 (need at least 1 prefix slot + 1 extend token)",
-        )
     if decode_steps < 1:
         return SyntheticDecodeReqOutput(
             success=False, message="decode_steps must be >= 1"
@@ -115,15 +110,46 @@ def handle_synthetic_decode_request(
     allocator = scheduler.token_to_kv_pool_allocator
     device = scheduler.req_to_token_pool.device
 
-    # Allocate fake-prefix KV slots up front per request. We allocate
-    # `prefix_len = seq_len - 1` slots; the scheduler's prepare_for_extend
-    # later allocates 1 more slot for the bootstrap-extend token.
-    prefix_len = seq_len - 1
+    # HiSparse's BaseTokenToKVPoolAllocator.alloc() raises NotImplementedError;
+    # it requires alloc_extend semantics that we don't replicate here. Fail
+    # loudly so the user knows to disable HiSparse for this benchmark mode.
+    allocator_cls = type(allocator).__name__
+    if "HiSparse" in allocator_cls:
+        return SyntheticDecodeReqOutput(
+            success=False,
+            message=(
+                f"{allocator_cls}.alloc() is not implemented; "
+                "synthetic decode injection currently only supports the standard "
+                "(non-HiSparse) token-to-kv allocator."
+            ),
+        )
+
+    # Page-align the fake prefix so the paged allocator returns exactly the
+    # number of slots we asked for, and so the extend kernel's last_loc/
+    # prefix_len alignment invariant holds. The unaligned tail becomes the
+    # bootstrap-extend portion (between 1 and page_size tokens, still cheap).
+    page_size = max(getattr(allocator, "page_size", 1), 1)
+    prefix_len = ((seq_len - 1) // page_size) * page_size
+    extend_len = seq_len - prefix_len  # in [1, page_size]
+    if prefix_len <= 0:
+        return SyntheticDecodeReqOutput(
+            success=False,
+            message=(
+                f"seq_len={seq_len} too small for page_size={page_size}; "
+                f"need seq_len > page_size to leave a non-empty fake prefix."
+            ),
+        )
+
     prefix_indices_list: List[torch.Tensor] = []
     for i in range(n_local):
         slots = allocator.alloc(prefix_len)
         if slots is None or len(slots) < prefix_len:
-            # Roll back what we already grabbed.
+            # Free any partial allocation we just got back, plus everything
+            # previously grabbed for earlier reqs. Skipping this leaks the
+            # whole partial chunk (paged allocators may return floor-aligned
+            # slot counts when prefix_len is not a page multiple).
+            if slots is not None and len(slots) > 0:
+                allocator.free(slots)
             for prev in prefix_indices_list:
                 allocator.free(prev)
             msg = (
@@ -176,7 +202,7 @@ def handle_synthetic_decode_request(
         # and prepare_for_extend treats `prefix_len` tokens as already cached.
         req.prefix_indices = prefix_indices_list[i]
         req.fill_ids = list(req.origin_input_ids)
-        req.extend_input_len = seq_len - prefix_len  # == 1
+        req.extend_input_len = extend_len  # in [1, page_size]
         req.already_computed = prefix_len
         req.cached_tokens = prefix_len
 
@@ -188,12 +214,16 @@ def handle_synthetic_decode_request(
 
     logger.info(
         "[synthetic-decode] rank=%d injected %d reqs (seq_len=%d, decode_steps=%d, "
-        "prefix_len=%d). 1-token extend will bootstrap, then pure decode.",
+        "page_size=%d, prefix_len=%d, extend_len=%d). Bootstrap extend will "
+        "process %d token(s), then pure decode.",
         dp_rank,
         n_local,
         seq_len,
         decode_steps,
+        page_size,
         prefix_len,
+        extend_len,
+        extend_len,
     )
     return SyntheticDecodeReqOutput(
         success=True,
