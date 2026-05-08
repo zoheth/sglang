@@ -162,18 +162,6 @@ def handle_synthetic_decode_request(
         prefix_indices_list.append(slots.to(device, non_blocking=True))
 
     fake_token = 1  # arbitrary; never read by attention compute
-    pad_id = (
-        scheduler.model_config.hf_eos_token_id[0]
-        if scheduler.model_config.hf_eos_token_id
-        else 0
-    )
-
-    sp_template = SamplingParams(
-        temperature=0.0,
-        max_new_tokens=decode_steps,
-        ignore_eos=True,  # gibberish output may otherwise hit EOS and cut runs short
-    )
-    sp_template.normalize(scheduler.tokenizer)
 
     for i in range(n_local):
         rid = f"synthetic-{uuid.uuid4().hex[:12]}-{i}"
